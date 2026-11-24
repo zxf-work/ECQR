@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+.DS_Store
+
+# Rust build artifacts and the compiled engine extension
+target/
+*.so
+*.pyd
+
+# data that is not redistributed (see README.md, "Data")
+data_raw/
+stores/
+*.duckdb
+
+# run outputs (task-run rows, server logs)
+runs/
+logs/

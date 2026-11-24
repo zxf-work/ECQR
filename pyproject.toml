@@ -1,0 +1,100 @@
+[project]
+name = "tgms"
+version = "0.6.0"
+description = "Agent-Native Temporal Graph Management System (bi-temporal property graph + validated temporal operator algebra + PEV agent layer)"
+requires-python = ">=3.11"
+readme = "README.md"
+license = "Apache-2.0"
+# PyPI validates that every License-File the metadata declares is actually
+# present in the distribution, and rejects the upload otherwise (400). The
+# sdist declared LICENSE and shipped without it; naming it here makes the
+# backend carry the file as well as the field.
+license-files = ["LICENSE"]
+authors = [{ name = "Xiaofei Zhang" }]
+keywords = ["temporal-graph", "bi-temporal", "llm-agents", "database", "verification"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.26",
+    "jsonschema>=4.23",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# DuckDB is no longer needed at runtime (D-029): the native engine is the
+# default. It remains available for opening pre-existing DuckDB stores, as
+# the A/B reference backend, and for the b6 text-to-SQL baseline. `pyarrow`
+# rides with it and not with the runtime: the only import in the package is
+# inside `duckdb_adapter`'s bulk loader, and requiring it of every user both
+# contradicted D-029's "no storage engine by default" and broke the
+# manylinux2014 wheel test, where pyarrow has no wheel and cannot build.
+duckdb = ["duckdb>=1.1", "pyarrow>=17"]
+# Kuzu is unavailable going forward (acquired), and was only ever a secondary
+# backend plus the b5 text-to-Cypher baseline. Pinned here for replaying the
+# frozen b5 results; nothing in the runtime needs it.
+kuzu = ["kuzu>=0.7"]
+# tenacity: litellm imports it lazily on its retry path and fails at task
+# time without it (found by the 2026-08-06 iTiger smoke job, one row lost)
+agent = ["litellm>=1.48", "fastmcp>=2.0", "tenacity>=8.2"]
+memory = ["faiss-cpu>=1.8", "sentence-transformers>=3.0"]
+eval = [
+    "psycopg[binary]>=3.2",
+    # ClickHouse HTTP client; Apache-2.0, like the server (D-035, spec §8.6)
+    "clickhouse-connect>=0.8",
+    # Neo4j bolt driver; Apache-2.0 (D-036, spec §8.6)
+    "neo4j>=5.20",
+    # the matrix harness's table assembly, and nothing else in the package
+    "pandas>=2.2",
+]
+
+[project.scripts]
+tgms = "tgms.cli:main"
+
+[project.urls]
+Homepage = "https://zxf-work.github.io/tgms/"
+Repository = "https://github.com/zxf-work/tgms"
+Documentation = "https://github.com/zxf-work/tgms/blob/main/docs/TECHNICAL_REPORT.md"
+
+[dependency-groups]
+dev = [
+    "duckdb>=1.1",       # reference backend for the A/B digest harness
+    "pyarrow>=17",       # its bulk loader; rides with duckdb, never runtime
+    "pandas>=2.2",       # the eval harness's tables, which the suite covers
+    "kuzu>=0.7",         # b5 baseline replay only
+    "pytest>=8.3",
+    "hypothesis>=6.112",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+# Mixed Rust/Python project (D-028/D-029): the pure-Python package `tgms`
+# stays where it is; the compiled engine is installed as the private
+# submodule `tgms._engine`, so the public import surface is unchanged.
+# Binary wheels cover the supported matrix — a source install (including
+# `uv sync` in a checkout) additionally needs a Rust toolchain.
+[tool.maturin]
+python-source = "."
+module-name = "tgms._engine"
+manifest-path = "crates/tgms-engine-py/Cargo.toml"
+features = ["pyo3/extension-module"]
+
+[tool.uv]
+python-preference = "managed"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

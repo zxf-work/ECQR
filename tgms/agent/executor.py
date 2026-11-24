@@ -1,0 +1,292 @@
+"""Executor (WP2.2): deterministic topological execution of the plan DAG.
+
+- Resolves $refs against materialized step outputs; the operator layer
+  re-validates every resolved arg set against its JSON Schema (defense in
+  depth — call_operator always validates).
+- Produces an execution trace: per step {step_id, op, resolved_args,
+  result_digest, rows_returned, truncated, wall_ms, status} plus full results
+  in a content-addressed store on disk keyed by digest.
+- Failure policy: a failed step fails its dependents; independent branches
+  still run; E_COST / E_NOT_FOUND return control to the planner repair loop.
+- Hard limits per plan: <= 12 steps, <= 60 s wall clock, <= 50k rows
+  materialized.
+"""
+
+from __future__ import annotations
+
+import graphlib
+import json
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from tgms.core.errors import InvalidArgError, LimitError
+from tgms.core.model import canonical_json, digest, sha256_hex
+from tgms.agent.ir import MAX_STEPS, Plan, substitute_refs
+from tgms.tools.server import ToolRouter
+
+MAX_WALL_S = 60.0
+MAX_TOTAL_ROWS = 50_000
+MAX_REF_ITEMS = 10_000  # [*] projections truncate to the largest arg maxItems
+
+#: `compute` functions that reduce their input to one number. Running one of
+#: these over a truncated page produces a wrong number rather than a partial
+#: one — measured at 50.5% low on CollegeMsg's directed pairs — so the step
+#: is refused instead of tainted (D-061).
+#:
+#: Only the scalar-producing functions. `filter`, `derive`, `join` and the
+#: set operations hand back rows that still carry `truncated`, and paging
+#: plans and preview listings are legitimate readings of page 1. Nothing
+#: escapes by that door: the taint is transitive, so a chain ending in a
+#: number fails at the number.
+REDUCING_FNS = frozenset({"count", "sum", "min", "max", "mean", "median",
+                          "ratio", "diff", "percent", "topk"})
+
+
+@dataclass
+class Trace:
+    plan_id: str
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    answer: Any = None
+    answer_error: str | None = None
+    wall_ms: float = 0.0
+
+    @property
+    def ok(self) -> bool:
+        return all(s["status"] == "ok" for s in self.steps) \
+            and self.answer_error is None
+
+    def to_json(self) -> dict[str, Any]:
+        return {"plan_id": self.plan_id, "steps": self.steps, "answer": self.answer,
+                "answer_error": self.answer_error, "wall_ms": round(self.wall_ms, 3),
+                "ok": self.ok}
+
+
+class ResultStore:
+    """Content-addressed store for full step results (traces stay small)."""
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def put(self, payload: dict[str, Any]) -> str:
+        d = payload.get("result_digest") or digest(payload)
+        path = self.root / f"{d}.json"
+        if not path.exists():
+            path.write_text(canonical_json(payload))
+        return d
+
+    def get(self, d: str) -> dict[str, Any]:
+        return json.loads((self.root / f"{d}.json").read_text())
+
+
+class Executor:
+    def __init__(self, router: ToolRouter, result_store: ResultStore | None = None,
+                 max_wall_s: float = MAX_WALL_S,
+                 max_total_rows: int = MAX_TOTAL_ROWS,
+                 propagate: bool = True) -> None:
+        self.router = router
+        #: False disables cross-step evidence propagation (Lemma 3.10 rules
+        #: (a) and (c)) and the basis-compatibility check: reducers over
+        #: truncated inputs and steps over mixed-basis inputs run, and each
+        #: step's descriptor is built from its own envelope alone.
+        #: Ablation only.
+        self.propagate = propagate
+        self.results = result_store
+        #: production keeps the 60 s default; the benchmark oracle lane
+        #: passes its own declared budget (plan §2c) — the wall is part of
+        #: the lane's envelope, not a constant of the machine
+        self.max_wall_s = max_wall_s
+        #: same principle for the materialized-row cap (oracle-v3.1): the
+        #: lane declares its cap instead of inheriting the module constant
+        #: silently
+        self.max_total_rows = max_total_rows
+
+    def run(self, plan: Plan) -> Trace:
+        if len(plan.steps) > MAX_STEPS:
+            raise LimitError(f"plan exceeds {MAX_STEPS} steps")
+        order = list(graphlib.TopologicalSorter(
+            {s.id: set(s.depends_on) for s in plan.steps}).static_order())
+        by_id = {s.id: s for s in plan.steps}
+
+        trace = Trace(plan_id=plan.plan_id)
+        # execution-context token: current-basis descriptors from this run
+        # are mutually comparable and never comparable across runs (round-3
+        # review §8 — the token travels in the descriptor itself)
+        ctx_token = uuid.uuid4().hex[:16]
+        store_id = str(getattr(self.router.adapter, "path", "store"))
+        outputs: dict[str, Any] = {}
+        failed: set[str] = set()
+        total_rows = 0
+        t_start = time.perf_counter()
+
+        for sid in order:
+            step = by_id[sid]
+            rec: dict[str, Any] = {"step_id": sid, "op": step.op}
+            elapsed = time.perf_counter() - t_start
+            if elapsed > self.max_wall_s:
+                rec.update(status="skipped", error={"error": "E_LIMIT",
+                           "message": f"plan wall clock {elapsed:.1f}s > {self.max_wall_s}s"})
+                trace.steps.append(rec)
+                failed.add(sid)
+                continue
+            if any(d in failed for d in step.depends_on):
+                rec.update(status="skipped",
+                           error={"error": "E_UPSTREAM",
+                                  "message": "a dependency failed"})
+                trace.steps.append(rec)
+                failed.add(sid)
+                continue
+
+            truncations: list[dict[str, Any]] = []
+            try:
+                resolved = substitute_refs(step.args, outputs, truncations,
+                                           MAX_REF_ITEMS)
+            except InvalidArgError as e:
+                rec.update(status="failed", error=e.to_payload())
+                trace.steps.append(rec)
+                failed.add(sid)
+                continue
+            # truncation taints dependents: a count over a truncated page is
+            # not a count over the full result — the verifier caps claims
+            # citing such steps at weakly_supported
+            upstream_truncated = bool(truncations) or any(
+                outputs.get(d, {}).get("truncated")
+                or next((s2 for s2 in trace.steps
+                         if s2["step_id"] == d), {}).get("upstream_truncated")
+                for d in step.depends_on)
+
+            # basis compatibility (Def. basis compatibility): a step whose
+            # input bases violate its operator's declaration fails before it
+            # runs and emits no descriptor
+            in_ecqrs: list[Any] | None = []
+            basis = None
+            if self.propagate:
+                from tgms.evidence.adapter_tgms import BasisMismatch, step_basis
+                try:
+                    in_ecqrs = self._input_ecqrs(step.depends_on, trace)
+                except Exception:  # unreadable input: this step gets none
+                    in_ecqrs = None
+                mismatch = None
+                if in_ecqrs is not None:
+                    try:
+                        basis = step_basis(step.op, resolved,
+                                           [e.basis for e in in_ecqrs],
+                                           store_id, ctx_token)
+                    except BasisMismatch as e:
+                        mismatch = e
+                if mismatch is not None:
+                    rec.update(status="failed", error={
+                        "error": "E_BASIS_MISMATCH",
+                        "message": str(mismatch),
+                        "details": {"op": mismatch.op, "bases": [
+                            dict(vars(b)) for b in mismatch.bases]}})
+                    trace.steps.append(rec)
+                    failed.add(sid)
+                    continue
+
+            if self.propagate and upstream_truncated \
+                    and step.op == "compute" \
+                    and resolved.get("fn") in REDUCING_FNS:
+                # The old message advised paging with `cursor`, which a
+                # single-shot plan DAG cannot express — Session 4 measured
+                # 10 of 10 such repairs failing to converge. Advise only
+                # what a plan can actually do.
+                rec.update(status="failed", upstream_truncated=True,
+                           error=LimitError(
+                               f"compute {resolved['fn']} would reduce a "
+                               f"truncated result to one number, which is a "
+                               f"wrong answer rather than a partial one. "
+                               f"Plans cannot loop over `cursor`. Expressible "
+                               f"fixes: for a count, read the producing "
+                               f"step's `rows_total` field directly (it is "
+                               f"exact even when the page truncates); for "
+                               f"grouped or filtered counts, use "
+                               f"`aggregate_events`, which aggregates inside "
+                               f"the engine without a page limit; otherwise "
+                               f"narrow the window or grouping so the result "
+                               f"fits one page.").to_payload())
+                trace.steps.append(rec)
+                failed.add(sid)
+                continue
+
+            t0 = time.perf_counter()
+            res = self.router.call(step.op, resolved)
+            wall = (time.perf_counter() - t0) * 1000
+            rec["resolved_args_sha"] = sha256_hex(canonical_json(resolved))[:16]
+            rec["wall_ms"] = round(wall, 3)
+            if truncations:
+                rec["ref_truncations"] = truncations
+
+            if "error" in res:
+                rec.update(status="failed", error=res)
+                failed.add(sid)
+            else:
+                rows = res.get("rows_total", len(res.get("rows", [])) or 0)
+                total_rows += int(rows or 0)
+                rec.update(status="ok", result_digest=res["result_digest"],
+                           rows_returned=rows,
+                           truncated=res.get("truncated", False),
+                           upstream_truncated=upstream_truncated)
+                # every successful step carries its evidence descriptor;
+                # capability inheritance runs over the dependency edges, so
+                # a certificate can never be laundered through a step whose
+                # inputs were delivery-incomplete (M2, D-100)
+                try:
+                    from tgms.evidence.adapter_tgms import build_ecqr
+                    if in_ecqrs is None:
+                        raise ValueError("an input descriptor is unreadable")
+                    rec["ecqr"] = build_ecqr(
+                        res, store_id=store_id,
+                        input_ecqrs=in_ecqrs if self.propagate else None,
+                        execution_context=ctx_token, basis=basis).to_json()
+                except Exception:  # descriptor failure must never fail a step
+                    rec["ecqr"] = None
+                outputs[sid] = res
+                if self.results is not None:
+                    self.results.put(res)
+                if total_rows > self.max_total_rows:
+                    rec["error"] = {"error": "E_LIMIT",
+                                    "message": f"materialized rows {total_rows} "
+                                               f"> {self.max_total_rows}"}
+                    rec["status"] = "failed"
+                    failed.add(sid)
+            trace.steps.append(rec)
+
+        trace.wall_ms = (time.perf_counter() - t_start) * 1000
+        self._resolve_answer(plan, outputs, trace)
+        return trace
+
+    @staticmethod
+    def _input_ecqrs(depends_on: list[str], trace: Trace) -> list[Any]:
+        """The descriptors of a step's dependencies, in edge order; a
+        dependency that emitted no descriptor contributes none."""
+        from tgms.evidence.ecqr import ECQR
+        out = []
+        for d in depends_on:
+            drec = next((s for s in trace.steps if s["step_id"] == d), None)
+            if drec and drec.get("ecqr"):
+                out.append(ECQR.from_json(drec["ecqr"]))
+        return out
+
+    @staticmethod
+    def _resolve_answer(plan: Plan, outputs: dict[str, Any], trace: Trace) -> None:
+        from tgms.agent.ir import parse_ref, resolve_ref
+
+        src = plan.answer_spec["from"]
+        try:
+            if "." in src:
+                ref = parse_ref(src)
+                if ref.step_id not in outputs:
+                    raise InvalidArgError(f"answer source step {ref.step_id} "
+                                          "did not complete")
+                trace.answer = resolve_ref(ref, outputs[ref.step_id])
+            else:
+                if src not in outputs:
+                    raise InvalidArgError(f"answer source step {src} did not complete")
+                trace.answer = {k: v for k, v in outputs[src].items()
+                                if k not in ("op", "args_echo", "dataset_extent")}
+        except InvalidArgError as e:
+            trace.answer_error = str(e)

@@ -1,0 +1,197 @@
+# Tool manual (WP1.5) — the operator descriptions LLM planners read.
+# Reviewed prose, one entry per operator. Every entry: semantics one-liner,
+# arg constraints, cost hint, one worked example. Timestamps are int64 epoch
+# MICROSECONDS, UTC; intervals/windows are half-open [start, end).
+
+entity_history:
+  description: |
+    Full version history of one node: every version of `uid` believed at
+    `as_of_tt` (default: current beliefs), ordered by valid-time start; set
+    include_edges=true to also get its incident edge versions.
+    Constraints: uid must come from resolve_entities or the task input.
+    Cost: cheap (single-identity lookup; incident edges add one scan).
+    Example: {"uid": "acme-corp", "include_edges": true, "limit": 50}
+    -> rows: [{vid, label, vt_s, vt_e, tt_s, tt_e, props}, ...]
+
+snapshot_subgraph:
+  description: |
+    The k-hop neighborhood (undirected expansion, hops <= 3) of `seeds` in
+    the snapshot graph at instant `t_valid`, under belief state `as_of_tt`;
+    returns induced edges (paginated `rows`) and nodes with hop distance.
+    Cost: cheap for hops <= 2; hop 3 on hubs can be large — lower `limit`.
+    Example: {"seeds": ["acme-corp"], "hops": 2, "t_valid": 1580515200000000}
+    -> rows: [{eid, src, dst, rel_type, vt_s, vt_e}, ...], nodes: [...]
+
+diff_snapshots:
+  description: |
+    What changed between the snapshots at t1 and t2 under one belief state:
+    nodes/edges added & removed (by logical identity) and props_changed.
+    Use `scope` {seeds, hops} to restrict to a neighborhood — strongly
+    recommended on large graphs. Each list is capped at `limit` and reports
+    a *_total count. Cost: two interval-pruned scans (moderate; scope helps).
+    Example: {"t1": 1580515200000000, "t2": 1583020800000000,
+              "scope": {"seeds": ["acme-corp"], "hops": 2}}
+
+temporal_reachability:
+  description: |
+    Which nodes are reachable from `src` via time-respecting paths (edge
+    times non-decreasing) inside `window` — returns earliest arrival per
+    node, source excluded, sorted by arrival. direction='in' answers "who
+    could reach src"; delta_max_wait caps the wait at intermediate nodes
+    (exact path semantics). Cost: linear in window edges without delta;
+    with delta it can be much heavier — keep windows narrow.
+    Example: {"src": "acme-corp",
+              "window": {"t_a": 1580515200000000, "t_b": 1583020800000000},
+              "direction": "out"}
+    -> rows: [{uid, earliest_arrival}, ...]
+
+temporal_paths:
+  description: |
+    Up to k (<= 20) concrete node-simple time-respecting paths src -> dst
+    inside `window`, hop cap 6, ordered by (arrival, hops). Use after
+    temporal_reachability confirms dst is reachable. Cost: exponential in
+    max_hops — keep max_hops <= 4 and windows narrow.
+    Example: {"src": "a", "dst": "d", "k": 3, "max_hops": 4,
+              "window": {"t_a": 0, "t_b": 1700000000000000}}
+    -> rows: [{arrival, hops, edges: [{src, dst, rel_type, t, eid}, ...]}]
+
+count_temporal_motifs:
+  description: |
+    Exact count of delta-temporal motif instances among edge events in
+    `window`: motif edges strictly time-ordered with span <= delta
+    (microseconds), motif nodes pairwise distinct, rel_type ignored.
+    Motifs: M_triangle_cyclic (u->v,v->w,w->u), M_triangle_acyclic_1
+    (u->v,u->w,v->w), M_2node_pingpong (u->v,v->u,u->v), M_star_out_3
+    (u->a,u->b,u->c), M_path_3 (u->v->w->x).
+    Cost: heavy — REQUIRES node_filter (<= 10k uids) on large graphs;
+    E_COST tells you when. Example: {"motif": "M_triangle_cyclic",
+    "delta": 86400000000, "window": {...}, "node_filter": ["a","b","c"]}
+
+find_temporal_motif_instances:
+  description: |
+    Like count_temporal_motifs but returns the instances themselves as
+    ordered edge-event tuples, paginated and deterministically ordered.
+    Use to name participants after counting. Same cost caveats.
+    Example adds: {"limit": 20} -> rows: [{edges: [{src,dst,t,eid,rel_type}
+    x3]}, ...]
+
+graph_metric_timeseries:
+  description: |
+    Per-bucket metric series over `window` with bucket width `stride`
+    (bucket count <= 2000). Metrics: node_count / active_edge_count /
+    mean_out_degree sample the bucket start; edge_event_count /
+    new_node_rate / reciprocity aggregate events inside the bucket.
+    CHOOSING vs aggregate_events: use THIS operator whenever the only
+    grouping is time — metric evolution, whole-window event totals
+    (stride = window width gives one bucket), busiest-bucket and rate
+    questions. Use aggregate_events only to group BY rel_type, endpoint,
+    label, or calendar unit, or for count_distinct / min / max / mean.
+    Cost: one interval-pruned scan — cheap.
+    Example: {"metric": "edge_event_count", "window": {...},
+              "stride": 604800000000}  # weekly buckets
+
+burst_detection:
+  description: |
+    Flag bursty buckets in an event-rate series. target.kind:
+    'edge_event_rate' (optionally per rel_type) or 'node_activity'
+    (requires target.uid; counts incident events). method 'zscore' flags
+    |x - trailing_mean| >= z * trailing_std over the previous params.w
+    buckets (default w=10, z=3); 'ratio' flags x / trailing_median >= r.
+    Returns only flagged buckets, with scores. Cost: cheap.
+    Example: {"target": {"kind": "edge_event_rate"}, "window": {...},
+              "stride": 86400000000, "method": "zscore"}
+
+neighborhood_evolution:
+  description: |
+    How `uid`'s neighborhood changed between t1 and t2: neighbors gained
+    and lost (undirected), plus an incident-active-edge-count series
+    sampled every `stride` (default (t2-t1)/20). Thin composition of
+    diff + timeseries scoped to one node — prefer it over manual diffs.
+    Cost: cheap. Example: {"uid": "acme-corp", "t1": ..., "t2": ...}
+
+co_active:
+  description: |
+    Interval join between two edge-version sets selected by a_spec/b_spec
+    {src?, dst?, rel_type?} under a strict Allen relation on valid time:
+    overlaps (a starts first, they overlap, b ends last), during (a inside
+    b), meets (a ends exactly when b starts), before (a ends, then b starts
+    within `gap`; gap required). Cost: moderate; narrow the specs.
+    Example: {"a_spec": {"src": "a", "rel_type": "R"},
+              "b_spec": {"rel_type": "S"},
+              "allen_relation": {"relation": "before", "gap": 3600000000}}
+
+compute:
+  description: |
+    Deterministic computation — never do arithmetic yourself.
+    Over a prior step's rows (`input`, normally {"$ref": "sN.rows"}, with an
+    optional numeric `field`): count, sum, min, max, mean, median; topk
+    (`field`, and exactly one of `k` -> best rows, or `pct` -> that
+    percentage of the rows); filter (`field`, `cmp` in
+    eq/ne/lt/le/gt/ge/contains, `value`).
+    `group_by` names a column of `input` and the reducer runs PER GROUP,
+    answering one row per group ordered by key: {"fn":"mean","input":{"$ref":
+    "s2.rows"},"group_by":"receiver","field":"latency"} is the average
+    latency for each receiver. `aggregate_events` groups the store; this
+    groups a RESULT, which is how you reduce something a join or a derive
+    produced. count/sum/min/max/mean/median REDUCE each group to a number;
+    `topk` SLICES each group and keeps its rows, so {"fn":"topk","input":
+    {"$ref":"s1.rows"},"group_by":"dst","field":"t","k":1,"side":"bottom"} is
+    the earliest row of each group WITH all its columns — which is how you
+    ask "who was first" rather than "when was first". `pct` is that group's
+    own size, so a slice is proportional to each group. Slice then reduce to
+    get "the mean of each account's first five".
+    `pct` is how you write "the top 10%" or "the top 1%": the row count is
+    rounded UP, so a positive percentage of a non-empty input is never an
+    empty page. `side` picks the end — "top" (default) or "bottom" — and
+    bottom is the exact complement of the matching top, so top `p`% and
+    bottom `100-p`% cover every row exactly once. That is what makes a ratio
+    between the two halves a ratio over one population. Do NOT write "the
+    bottom half" as a `derive mul -1` in front of a top-half topk: both
+    sides then round up and an odd row count falls in both.
+    Rows tied on `field` are split by rank, not by value, so two rows with
+    the same value can land on opposite sides of a `pct` boundary.
+    A grouped result may hold null cells — max_gap for an account with one
+    event, mean_duration for a group with no closed interval — and the
+    reducers refuse them. Drop them first with filter (`cmp`: not_null, no
+    `value`), or select exactly those rows with is_null.
+    Over two scalars from earlier steps, passed as `x` and `y` (each normally
+    {"$ref": "sN.value"} or {"$ref": "sN.rows[0].count"}): ratio -> x/y,
+    diff -> x-y, percent -> 100*x/y. Use these to compare or combine two
+    results; they take no `input`.
+    Over two lists, passed as `input` and `other` (each normally
+    {"$ref": "sN.rows"}, with `field`/`other_field` naming the column to take
+    from each): intersect, difference, union. Use these for "both X and Y"
+    (intersect), "X but never Y" (difference) and "either" (union) over uid
+    sets from two groupings. The answer is a deduplicated, canonically
+    ordered list in `rows`, with `rows_total` its size.
+    Row work: derive(`field`, `field2` or `value`, `op`, `into`) adds ONE
+    computed column to the rows — op in add/sub/mul/div/floordiv/concat —
+    e.g. a per-group span {"fn":"derive","field":"max_vt_s",
+    "field2":"min_vt_s","op":"sub","into":"span"}, then floordiv by 86400000000
+    for days. join(`other`, `on`, `other_on`, `how`, `fill`) aligns two prior
+    steps on a key; the right side's columns arrive prefixed `r_`. Keys must
+    be UNIQUE on both sides (group first). how=inner keeps matched keys only,
+    how=left keeps every left row and fills the right with `fill`. The pair
+    derive+join is how you compare two groupings: join them, then derive the
+    difference or ratio.
+    Also interval_relation (`a`, `b` half-open intervals -> Allen relation
+    name).
+    Integer inputs give exact integer answers; anything inexact is rounded
+    once. Cost: trivial.
+    Examples: {"fn": "topk", "input": {"$ref": "s2.rows"}, "field": "value",
+    "k": 3} · the top 1% by volume: {"fn": "topk", "input": {"$ref":
+    "s1.rows"}, "field": "count", "pct": 1} · the bottom half of the same
+    ranking: {"fn": "topk", "input": {"$ref": "s1.rows"}, "field": "count",
+    "pct": 50, "side": "bottom"} ·
+    {"fn": "mean", "input": {"$ref": "s1.rows"}, "field": "count"} ·
+    {"fn": "diff", "x": {"$ref": "s1.rows[0].count"},
+    "y": {"$ref": "s2.rows[0].count"}}
+
+resolve_entities:
+  description: |
+    Look up node uids by name: exact uid match first, then case-insensitive
+    substring on uid and on the `name` property of any believed version.
+    ALWAYS use this to obtain uids — never invent identifiers; plans with
+    literal uids not from the task input or a prior step are rejected.
+    Cost: cheap. Example: {"query": "ACME", "label": "Org", "limit": 5}
+    -> rows: [{uid, label, name, match}, ...]

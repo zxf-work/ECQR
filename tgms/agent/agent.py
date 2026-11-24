@@ -1,0 +1,98 @@
+"""Agent facade (spec 7.3.1): `tgms.Agent(store, model=...)` — the interface
+researchers touch. Ties Planner -> static Verifier -> Executor with the
+runtime repair loop (E_COST / E_NOT_FOUND return control to the planner).
+The claim-level reporter/verifier (WP2.3b) attaches at M5.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Callable
+
+from tgms.agent.executor import Executor, ResultStore, Trace
+from tgms.agent.planner import Planner, PlanResult
+from tgms.store import Store
+from tgms.tools.server import ToolRouter
+
+# Runtime errors whose payloads carry an actionable fix (narrowing
+# suggestions, "increase stride", "$ref resolved to 0 rows"): feed them back
+# through the repair loop within the same budget. E_STATE / E_INTERNAL are
+# genuine faults and stay terminal. E_LIMIT / E_INVALID_ARG / E_SCHEMA can
+# surface at runtime when a $ref materializes an empty or ill-typed value
+# that static checking (shapes, not values) cannot see.
+REPAIRABLE = {"E_COST", "E_NOT_FOUND", "E_LIMIT", "E_INVALID_ARG", "E_SCHEMA"}
+
+
+def dataset_card(store: Store) -> dict[str, Any]:
+    s = store.stats()
+    return {
+        "extent": {"vt_min": s["vt_min"], "vt_max": s["vt_max"]},
+        "n_entities": s["n_entities"],
+        "n_edge_versions": s["n_edge_versions"],
+        "rel_types": sorted(s["rel_type_counts"]),
+    }
+
+
+class Agent:
+    def __init__(self, store: Store, model: str,
+                 llm_fn: Callable[..., str] | None = None,
+                 cache_dir: str | Path | None = None,
+                 max_repairs: int = 3, seed: int = 0,
+                 guided: bool = False,
+                 ablate_output_contracts: bool = False,
+                 exclude_ops: tuple[str, ...] = ()) -> None:
+        from tgms.tools.schemas import tool_description
+
+        self.store = store
+        # exclude_ops restricts the whole surface in one move: the router
+        # refuses the op AND the planner's tool manual never mentions it —
+        # the M6 nested-algebra experiment's lever (a restriction only at
+        # the router would measure error recovery, not interface size)
+        self.router = ToolRouter(store.adapter, exclude=exclude_ops)
+        manual = "\n".join(f"### {name}\n{tool_description(name)}"
+                           for name in self.router.tools())
+        self.planner = Planner(model=model, tool_manual=manual, llm_fn=llm_fn,
+                               cache_dir=cache_dir, max_repairs=max_repairs,
+                               seed=seed, guided=guided)
+        self.planner.check_output_fields = not ablate_output_contracts
+        self.executor = Executor(self.router,
+                                 ResultStore(Path(store.path) / "results")
+                                 if store.path else None)
+
+    def ask(self, question: str,
+            task_input_uids: set[str] | None = None,
+            memory_notes: list[str] | None = None) -> dict[str, Any]:
+        """Plan -> execute, with runtime repairs sharing the repair budget.
+        Returns {plan_result, trace, answer}."""
+        card = dataset_card(self.store)
+        result: PlanResult = self.planner.plan(
+            question, card, adapter=self.store.adapter,
+            task_input_uids=task_input_uids, memory_notes=memory_notes)
+        trace: Trace | None = None
+        while result.plan is not None:
+            trace = self.executor.run(result.plan)
+            runtime_error = next(
+                (s["error"] for s in trace.steps
+                 if s.get("error", {}).get("error") in REPAIRABLE), None)
+            if runtime_error is None and trace.answer_error is not None:
+                # Answer extraction failed on a plan whose steps all ran: the
+                # same repair budget applies — the payload names the broken
+                # reference so the planner can re-point the answer_spec or
+                # re-shape the producing step. Measured before this branch
+                # existed: such rows died at 1-2 LLM calls because nothing
+                # routed them into the loop.
+                runtime_error = {"error": "E_ANSWER",
+                                 "message": trace.answer_error,
+                                 "details": {"failed_at": "answer_spec"}}
+            if runtime_error is None or \
+                    len(result.attempts) > self.planner.max_repairs:
+                break
+            result = self.planner.plan(
+                question, card, adapter=self.store.adapter,
+                task_input_uids=task_input_uids, memory_notes=memory_notes,
+                runtime_error=runtime_error, prior=result)
+        return {
+            "plan_result": result,
+            "trace": trace,
+            "answer": trace.answer if trace is not None else None,
+        }
