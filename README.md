@@ -163,29 +163,9 @@ Mini-Dev databases, SNAP graphs) that this repository does not
 redistribute. [docs/REPRODUCING.md](docs/REPRODUCING.md) gives the data
 pins, the store-building steps and the cluster job scripts.
 
-### Main results
-
-Receipts are in `benchmarks/results-v1/`; the full table is in
-[docs/REPRODUCING.md](docs/REPRODUCING.md#experiments).
-
-| result | Supp. | script | receipt | needs |
-|---|---|---|---|---|
-| EvidenceBench fault matrix | §6 Fig. 4; §7 Table 1 | `scripts/eval_fault_matrix.py` | `eval-fault-matrix.json` | CPU |
-| Baseline checkers and composition cells | §9 Tables 4, 5 | `scripts/eval_baseline_checkers_v2.py` | `eval-baseline-checkers-v3.json` | CPU |
-| Top-k EvidenceBench cells | §10 Table 6 | `scripts/eval_topk_cells.py` | `eval-topk-cells.json` | CPU |
-| Verifier scaling, descriptor bytes | | `scripts/eval_verifier_scaling.py` | `eval-verifier-scaling.json` | CPU |
-| SQL page/count snapshot stress test | §11 Table 7 | `scripts/eval_sql_snapshot.py` | `eval-sql-snapshot.json`, `eval-sql-snapshot-pg.json` | CPU |
-| Basis semantics under live correction | §15 Fig. 5 | `tests/test_live_basis.py` | the test itself | CPU |
-| LDBC coverage | §7 Table 3 | `external_workloads/scripts/annotate_ldbc_coverage.py` | `eval-ldbc-coverage.json` | CPU |
-| Top-k routes on BIRD | §12 Table 8 | `scripts/eval_bird_topk.py` | `eval-bird-topk-v3.json` | CPU, BIRD data |
-| BIRD contract coverage | §7 Table 2 | `external_workloads/scripts/run_bird_agent.py` | `eval-bird-agent.json` | GPU + LLM, BIRD data (replay: CPU) |
-| Frozen task runs | §8 | `tgms eval run`, `scripts/m8_tables.py` | `m8/m8-tables.json` | GPU + LLM, SNAP stores |
-| Replay control | §8 | `scripts/gate_counterfactual.py` | `eval-gate-counterfactual.json` | CPU, the task-run rows |
-| Truncation probe without ECQR | §14; §16 Table 11 | `external_workloads/probe/run_probe.py` | `eval-trunc-probe.json` | GPU + LLM, BIRD data |
-| Truncation probe under the ECQR gate | §16 Table 11 | `external_workloads/probe/run_probe_ecqr.py` | `eval-trunc-probe-ecqr.json` | GPU + LLM, BIRD data |
-
-"GPU + LLM" means vLLM 0.11.0 serving `Qwen/Qwen2.5-14B-Instruct-AWQ`.
-The task-run rows (`runs/`) are not committed.
+Every result, with its script, its receipt in `benchmarks/results-v1/`,
+its place in the supplementary material, and what it needs to run, is
+listed in [docs/REPRODUCING.md](docs/REPRODUCING.md#experiments).
 
 ## Provenance
 
